@@ -111,46 +111,107 @@ pub fn App() -> impl IntoView {
 
     let toggle_download = move |_| {
         if is_downloading.get() {
-            // TRIGGERS PAUSE
+            // TRIGGERS MANUAL PAUSE
             spawn_local(async move {
                 let _ = invoke("stop_download", JsValue::NULL).await;
                 set_status.set("Pausing download...".to_string());
                 set_is_downloading.set(false);
             });
         } else {
-            // TRIGGERS START / RESUME
+            // TRIGGERS START / AUTO-RESUME
             let u = url.get();
             let o = output.get();
-            let t = threads.get();
+            let mut t = threads.get(); 
             
             spawn_local(async move {
                 set_is_downloading.set(true);
-                set_progress.set(HashMap::new()); // Reset Map. Backend will instantly repopulate it!
-                set_global_downloaded.set(0);
-                set_global_total.set(0);
-                set_speed.set(0.0);
-                set_eta.set(0.0);
-                set_last_time.set(js_sys::Date::now());
-                set_last_bytes.set(0);
                 
-                set_status.set("Connecting...".to_string());
-                
-                let args = DownloadArgs { url: &u, output: &o, threads: t };
-                let js_args = serde_wasm_bindgen::to_value(&args).unwrap();
-                
-                match invoke("start_download", js_args).await {
-                    Ok(res) => {
-                        set_eta.set(0.0);
-                        set_speed.set(0.0);
-                        set_status.set(res.as_string().unwrap_or_else(|| "Done".into()));
-                        set_is_downloading.set(false);
-                    }
-                    Err(err) => {
-                        let error_msg = err.as_string().unwrap_or_else(|| "Unknown error".into());
-                        set_status.set(format!("❌ {}", error_msg));
-                        set_is_downloading.set(false);
-                        set_speed.set(0.0);
-                        set_eta.set(0.0);
+                // --- THE AUTONOMOUS ORCHESTRATOR LOOP ---
+                loop {
+                    set_progress.set(HashMap::new()); 
+                    set_global_downloaded.set(0);
+                    set_global_total.set(0);
+                    set_speed.set(0.0);
+                    set_eta.set(0.0);
+                    set_last_time.set(js_sys::Date::now());
+                    set_last_bytes.set(0);
+                    
+                    set_status.set(format!("Connecting ({} threads)...", t));
+                    
+                    let args = DownloadArgs { url: &u, output: &o, threads: t };
+                    let js_args = serde_wasm_bindgen::to_value(&args).unwrap();
+                    
+                    match invoke("start_download", js_args).await {
+                        Ok(res) => {
+                            // Download Complete!
+                            set_eta.set(0.0);
+                            set_speed.set(0.0);
+                            set_status.set(res.as_string().unwrap_or_else(|| "Done".into()));
+                            set_is_downloading.set(false);
+                            break; 
+                        }
+                        Err(err) => {
+                            let error_msg = err.as_string().unwrap_or_else(|| "Unknown error".into());
+                            
+                            // 1. Did the user click pause manually?
+                            if error_msg.contains("Download Paused") || !is_downloading.get() {
+                                set_status.set("Download Paused. Ready to Resume.".into());
+                                set_is_downloading.set(false);
+                                break;
+                            }
+                            
+                            // 2. Did the server limit us at the start?
+                            if error_msg.starts_with("RATE_LIMIT:") {
+                                let parts: Vec<&str> = error_msg.split(':').collect();
+                                let survived: u64 = parts.get(1).unwrap_or(&"0").parse().unwrap_or(0);
+                                
+                                if survived > 0 && survived < t {
+                                    t = survived; 
+                                } else {
+                                    t = t.saturating_sub(1).max(1);
+                                }
+                                
+                                set_threads.set(t); 
+                                set_status.set(format!("Server limit hit! Auto-resuming with {} unused thread(s) in 3 seconds...", t));
+                                
+                                #[derive(Serialize, Deserialize)]
+                                struct SleepArgs { ms: u64 }
+                                let sleep_args = serde_wasm_bindgen::to_value(&SleepArgs { ms: 3000 }).unwrap();
+                                let _ = invoke("sleep_delay", sleep_args).await;
+                                
+                                if !is_downloading.get() {
+                                    set_status.set("Download Paused. Ready to Resume.".into());
+                                    break;
+                                }
+                                
+                                continue; 
+                            }
+
+                            // 3. NEW: Did the server randomly sever a connection mid-download?
+                            if error_msg.contains("lost connection") || error_msg.contains("failed to connect") || error_msg.contains("error decoding") {
+                                set_status.set("Network drop detected! Auto-resuming in 3 seconds...".into());
+                                
+                                #[derive(Serialize, Deserialize)]
+                                struct SleepArgs { ms: u64 }
+                                let sleep_args = serde_wasm_bindgen::to_value(&SleepArgs { ms: 3000 }).unwrap();
+                                let _ = invoke("sleep_delay", sleep_args).await;
+                                
+                                if !is_downloading.get() {
+                                    set_status.set("Download Paused. Ready to Resume.".into());
+                                    break;
+                                }
+                                
+                                // Loop back to the top! The .boltfetch file ensures we don't lose progress.
+                                continue; 
+                            }
+                            
+                            // 4. For any other fatal errors (like Disk Full, 404 Not Found)
+                            set_status.set(format!("❌ {}", error_msg));
+                            set_is_downloading.set(false);
+                            set_speed.set(0.0);
+                            set_eta.set(0.0);
+                            break;
+                        }
                     }
                 }
             });

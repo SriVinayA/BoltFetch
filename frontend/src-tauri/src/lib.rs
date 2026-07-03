@@ -8,37 +8,26 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 
-// --- Payload & State Structures ---
 #[derive(Clone, Serialize)]
-struct ProgressPayload {
-    thread_id: usize,
-    chunk_size: u64,
-    bytes_downloaded: u64,
-}
+struct ProgressPayload { thread_id: usize, chunk_size: u64, bytes_downloaded: u64 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-struct ChunkState {
-    id: usize,
-    start: u64,
-    current: u64,
-    end: u64,
-}
+struct ChunkState { id: usize, start: u64, current: u64, end: u64 }
 
 #[derive(Serialize, Deserialize, Clone)]
-struct DownloadState {
-    url: String,
-    total_size: u64,
-    chunks: Vec<ChunkState>,
-}
+struct DownloadState { url: String, total_size: u64, chunks: Vec<ChunkState> }
 
-pub struct AppState {
-    pub cancel_flag: Arc<AtomicBool>,
-}
+pub struct AppState { pub cancel_flag: Arc<AtomicBool> }
 
-// --- The New Pause Command ---
 #[tauri::command]
 fn stop_download(state: tauri::State<'_, AppState>) {
     state.cancel_flag.store(true, Ordering::SeqCst);
+}
+
+// --- NEW: A sleep command so the frontend can wait between auto-retries ---
+#[tauri::command]
+async fn sleep_delay(ms: u64) {
+    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
 }
 
 #[tauri::command]
@@ -50,7 +39,6 @@ async fn start_download(
     threads: u64,
 ) -> Result<String, String> {
     
-    // Reset the pause flag
     state.cancel_flag.store(false, Ordering::SeqCst);
 
     let client = Client::builder()
@@ -63,7 +51,6 @@ async fn start_download(
         return Err("Server does not support multipart downloads. Cannot resume.".into());
     }
 
-    // Resolve Final Filename
     let mut final_filename = output.clone();
     if let Some(cd_header) = range_check.headers().get(CONTENT_DISPOSITION) {
         if let Ok(cd_str) = cd_header.to_str() {
@@ -91,14 +78,12 @@ async fn start_download(
     file_path.push(&final_filename);
     let state_file_path = file_path.with_extension("boltfetch");
 
-    // --- PAUSE / RESUME LOGIC ---
     let mut download_state = DownloadState { url: url.clone(), total_size: content_length, chunks: Vec::new() };
     let mut is_resume = false;
 
     if state_file_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&state_file_path) {
             if let Ok(parsed) = serde_json::from_str::<DownloadState>(&content) {
-                // Only resume if it's the exact same file
                 if parsed.url == url && parsed.total_size == content_length {
                     download_state = parsed;
                     is_resume = true;
@@ -120,7 +105,6 @@ async fn start_download(
         return Err("Target file is missing. Please delete the .boltfetch file and start over.".into());
     }
 
-    // Instantly emit the saved progress to the UI so bars jump to where they left off!
     for chunk in &download_state.chunks {
         let _ = app.emit("download-progress", ProgressPayload {
             thread_id: chunk.id,
@@ -136,11 +120,11 @@ async fn start_download(
         let _ = std::fs::remove_file(&state_file_path);
         return Ok(format!("Saved to {}", file_path.display()));
     }
-
+    
+    let total_pending = pending_chunks.len();
     let file = std::fs::OpenOptions::new().write(true).open(&file_path).map_err(|e| format!("Failed to open file: {}", e))?;
     let file = Arc::new(file);
 
-    // --- DYNAMIC THREAD BUFFERING ---
     let pending_futures = pending_chunks.into_iter().map(|chunk| {
         let client_clone = client.clone();
         let file_clone = file.clone();
@@ -158,7 +142,7 @@ async fn start_download(
                 .map_err(|e| format!("Chunk {} failed to connect: {}", chunk.id, e))?;
 
             if response.status() == StatusCode::TOO_MANY_REQUESTS || response.status() == StatusCode::SERVICE_UNAVAILABLE {
-                return Err(format!("Server blocked connection. Pause, reduce Threads to 1, and Resume."));
+                return Err("SERVER_BLOCKED".to_string());
             } else if !response.status().is_success() {
                 return Err(format!("Chunk {} failed: HTTP {}", chunk.id, response.status()));
             }
@@ -167,11 +151,7 @@ async fn start_download(
             let mut downloaded_for_this_thread = chunk.current - chunk.start;
 
             while let Some(chunk_bytes) = response.chunk().await.map_err(|e| format!("Chunk {} lost connection: {}", chunk.id, e))? {
-                
-                // Catch the manual Stop/Pause trigger
-                if cancel_flag.load(Ordering::Relaxed) {
-                    return Err("Paused by user".to_string());
-                }
+                if cancel_flag.load(Ordering::Relaxed) { return Err("Paused by user".to_string()); }
 
                 let mut chunk_offset = 0;
                 while chunk_offset < chunk_bytes.len() {
@@ -196,20 +176,32 @@ async fn start_download(
         }
     });
 
-    // Run connections concurrently, STRICTLY limited to the user's thread count input
     let stream = stream::iter(pending_futures).buffer_unordered(threads as usize);
     let results: Vec<Result<(), String>> = stream.collect().await;
 
-    let mut error_msg = String::new();
+    // --- NEW: Advanced Error Analysis ---
+    let mut rate_limit_hits = 0;
+    let mut generic_error = String::new();
+
     for res in results {
         if let Err(e) = res {
-            if error_msg.is_empty() { error_msg = e; }
+            if e == "SERVER_BLOCKED" {
+                rate_limit_hits += 1;
+            } else if generic_error.is_empty() {
+                generic_error = e;
+            }
         }
     }
 
-    if !error_msg.is_empty() {
-        if error_msg == "Paused by user" { return Err("Download Paused. Ready to Resume.".to_string()); }
-        return Err(error_msg);
+    if rate_limit_hits > 0 {
+        // Calculate exactly how many threads were successfully used
+        let survived = total_pending - rate_limit_hits;
+        return Err(format!("RATE_LIMIT:{}:{}", survived, threads));
+    }
+
+    if !generic_error.is_empty() {
+        if generic_error == "Paused by user" { return Err("Download Paused. Ready to Resume.".to_string()); }
+        return Err(generic_error);
     }
 
     let _ = std::fs::remove_file(&state_file_path);
@@ -220,10 +212,9 @@ async fn start_download(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .manage(AppState {
-            cancel_flag: Arc::new(AtomicBool::new(false)),
-        })
-        .invoke_handler(tauri::generate_handler![start_download, stop_download]) // Registered Stop Command
+        .manage(AppState { cancel_flag: Arc::new(AtomicBool::new(false)) })
+        // Make sure all 3 commands are registered!
+        .invoke_handler(tauri::generate_handler![start_download, stop_download, sleep_delay]) 
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
