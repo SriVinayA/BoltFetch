@@ -1,13 +1,14 @@
-use futures::future::join_all;
-use reqwest::header::{CONTENT_LENGTH, RANGE};
+use futures::stream::{self, StreamExt};
+use reqwest::header::{CONTENT_DISPOSITION, CONTENT_RANGE, RANGE};
 use reqwest::{Client, StatusCode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter}; // Allows us to emit events to the frontend
+use tauri::{AppHandle, Emitter};
 
-// This struct defines the data we send to the frontend for the progress bar
+// --- Payload & State Structures ---
 #[derive(Clone, Serialize)]
 struct ProgressPayload {
     thread_id: usize,
@@ -15,110 +16,214 @@ struct ProgressPayload {
     bytes_downloaded: u64,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct ChunkState {
+    id: usize,
+    start: u64,
+    current: u64,
+    end: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct DownloadState {
+    url: String,
+    total_size: u64,
+    chunks: Vec<ChunkState>,
+}
+
+pub struct AppState {
+    pub cancel_flag: Arc<AtomicBool>,
+}
+
+// --- The New Pause Command ---
+#[tauri::command]
+fn stop_download(state: tauri::State<'_, AppState>) {
+    state.cancel_flag.store(true, Ordering::SeqCst);
+}
+
 #[tauri::command]
 async fn start_download(
-    app: AppHandle, // Injected by Tauri to handle events
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
     url: String,
     output: String,
     threads: u64,
-) -> Result<String, String> { // We return Result so the frontend can catch errors
-    let client = Client::new();
+) -> Result<String, String> {
+    
+    // Reset the pause flag
+    state.cancel_flag.store(false, Ordering::SeqCst);
 
-    // 1. Get total Content-Length
-    let head_res = client.head(&url).send().await.map_err(|e| e.to_string())?;
-    let content_length = head_res
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-        .ok_or("Could not get Content-Length from server")?;
+    let client = Client::builder()
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
-    // 2. The Bulletproof Range Check
-    let range_check = client
-        .get(&url)
-        .header(RANGE, "bytes=0-0")
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-
+    let range_check = client.get(&url).header(RANGE, "bytes=0-0").send().await.map_err(|e| format!("Network error: {}", e))?;
     if range_check.status() != StatusCode::PARTIAL_CONTENT {
-        return Err("Server does not support multipart downloads.".into());
+        return Err("Server does not support multipart downloads. Cannot resume.".into());
     }
 
-    // 3. Pre-allocate the file on disk
-    let file = File::create(&output).map_err(|e| e.to_string())?;
-    file.set_len(content_length).map_err(|e| e.to_string())?;
+    // Resolve Final Filename
+    let mut final_filename = output.clone();
+    if let Some(cd_header) = range_check.headers().get(CONTENT_DISPOSITION) {
+        if let Ok(cd_str) = cd_header.to_str() {
+            if let Some(name_start) = cd_str.find("filename=") {
+                let rest = &cd_str[name_start + 9..];
+                let name = rest.split(';').next().unwrap_or(rest).trim_matches(|c| c == '"' || c == '\'');
+                if !name.is_empty() { final_filename = name.to_string(); }
+            }
+        }
+    }
+    if final_filename == output {
+        if let Some(path_segment) = range_check.url().path_segments().and_then(|s| s.last()) {
+            if !path_segment.is_empty() && path_segment.contains('.') {
+                final_filename = path_segment.split('?').next().unwrap_or(path_segment).to_string();
+            }
+        }
+    }
+    let _ = app.emit("filename-resolved", final_filename.clone());
+
+    let content_length: u64 = range_check.headers().get(CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok()).ok_or("No Content-Range header")?
+        .split('/').last().and_then(|s| s.parse().ok()).ok_or("Failed to parse size")?;
+
+    let mut file_path = dirs::download_dir().ok_or("Could not find Downloads directory")?;
+    file_path.push(&final_filename);
+    let state_file_path = file_path.with_extension("boltfetch");
+
+    // --- PAUSE / RESUME LOGIC ---
+    let mut download_state = DownloadState { url: url.clone(), total_size: content_length, chunks: Vec::new() };
+    let mut is_resume = false;
+
+    if state_file_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&state_file_path) {
+            if let Ok(parsed) = serde_json::from_str::<DownloadState>(&content) {
+                // Only resume if it's the exact same file
+                if parsed.url == url && parsed.total_size == content_length {
+                    download_state = parsed;
+                    is_resume = true;
+                }
+            }
+        }
+    }
+
+    if !is_resume {
+        let chunk_size = content_length / threads;
+        for i in 0..(threads as usize) {
+            let start = (i as u64) * chunk_size;
+            let end = if i == (threads as usize) - 1 { content_length - 1 } else { (i as u64 + 1) * chunk_size - 1 };
+            download_state.chunks.push(ChunkState { id: i, start, current: start, end });
+        }
+        let file = File::create(&file_path).map_err(|e| format!("Failed to create file: {}", e))?;
+        file.set_len(content_length).map_err(|e| format!("Failed to allocate disk space: {}", e))?;
+    } else if !file_path.exists() {
+        return Err("Target file is missing. Please delete the .boltfetch file and start over.".into());
+    }
+
+    // Instantly emit the saved progress to the UI so bars jump to where they left off!
+    for chunk in &download_state.chunks {
+        let _ = app.emit("download-progress", ProgressPayload {
+            thread_id: chunk.id,
+            chunk_size: chunk.end - chunk.start + 1,
+            bytes_downloaded: chunk.current.saturating_sub(chunk.start),
+        });
+    }
+
+    let shared_state = Arc::new(tokio::sync::Mutex::new(download_state.clone()));
+    let pending_chunks: Vec<ChunkState> = download_state.chunks.into_iter().filter(|c| c.current <= c.end).collect();
+
+    if pending_chunks.is_empty() {
+        let _ = std::fs::remove_file(&state_file_path);
+        return Ok(format!("Saved to {}", file_path.display()));
+    }
+
+    let file = std::fs::OpenOptions::new().write(true).open(&file_path).map_err(|e| format!("Failed to open file: {}", e))?;
     let file = Arc::new(file);
 
-    let chunk_size = content_length / threads;
-    let mut tasks = Vec::new();
-
-    // 4. Spawn Concurrent Streaming Tasks
-    for i in 0..(threads as usize) {
+    // --- DYNAMIC THREAD BUFFERING ---
+    let pending_futures = pending_chunks.into_iter().map(|chunk| {
         let client_clone = client.clone();
         let file_clone = file.clone();
         let url_clone = url.clone();
-        let app_clone = app.clone(); // Clone the app handle to emit events
+        let app_clone = app.clone();
+        let cancel_flag = state.cancel_flag.clone();
+        let shared_state_clone = shared_state.clone();
+        let state_file_path_clone = state_file_path.clone();
 
-        let start = (i as u64) * chunk_size;
-        let end = if i == (threads as usize) - 1 {
-            content_length - 1
-        } else {
-            (i as u64 + 1) * chunk_size - 1
-        };
-        let total_chunk_size = end - start + 1;
+        async move {
+            let total_chunk_size = chunk.end - chunk.start + 1;
+            let range_header = format!("bytes={}-{}", chunk.current, chunk.end);
+            
+            let mut response = client_clone.get(&url_clone).header(RANGE, range_header).send().await
+                .map_err(|e| format!("Chunk {} failed to connect: {}", chunk.id, e))?;
 
-        let task = tokio::spawn(async move {
-            let range_header = format!("bytes={}-{}", start, end);
-            let mut response = client_clone
-                .get(url_clone)
-                .header(RANGE, range_header)
-                .send()
-                .await
-                .expect("Failed to send request");
+            if response.status() == StatusCode::TOO_MANY_REQUESTS || response.status() == StatusCode::SERVICE_UNAVAILABLE {
+                return Err(format!("Server blocked connection. Pause, reduce Threads to 1, and Resume."));
+            } else if !response.status().is_success() {
+                return Err(format!("Chunk {} failed: HTTP {}", chunk.id, response.status()));
+            }
 
-            let mut current_offset = start;
-            let mut downloaded_for_this_thread = 0;
+            let mut current_offset = chunk.current;
+            let mut downloaded_for_this_thread = chunk.current - chunk.start;
 
-            while let Some(chunk) = response.chunk().await.expect("Failed to read chunk") {
+            while let Some(chunk_bytes) = response.chunk().await.map_err(|e| format!("Chunk {} lost connection: {}", chunk.id, e))? {
+                
+                // Catch the manual Stop/Pause trigger
+                if cancel_flag.load(Ordering::Relaxed) {
+                    return Err("Paused by user".to_string());
+                }
+
                 let mut chunk_offset = 0;
-
-                while chunk_offset < chunk.len() {
-                    let bytes_written = file_clone
-                        .write_at(&chunk[chunk_offset..], current_offset)
-                        .expect("Failed to write to disk");
-
+                while chunk_offset < chunk_bytes.len() {
+                    let bytes_written = file_clone.write_at(&chunk_bytes[chunk_offset..], current_offset)
+                        .map_err(|e| format!("Disk write error: {}", e))?;
                     chunk_offset += bytes_written;
                     current_offset += bytes_written as u64;
                     downloaded_for_this_thread += bytes_written as u64;
                 }
 
-                // EMIT PROGRESS TO FRONTEND
-                let _ = app_clone.emit(
-                    "download-progress",
-                    ProgressPayload {
-                        thread_id: i,
-                        chunk_size: total_chunk_size,
-                        bytes_downloaded: downloaded_for_this_thread,
-                    },
-                );
-            }
-        });
+                {
+                    let mut s = shared_state_clone.lock().await;
+                    if let Some(c) = s.chunks.iter_mut().find(|c| c.id == chunk.id) { c.current = current_offset; }
+                    let _ = std::fs::write(&state_file_path_clone, serde_json::to_string(&*s).unwrap());
+                }
 
-        tasks.push(task);
+                let _ = app_clone.emit("download-progress", ProgressPayload {
+                    thread_id: chunk.id, chunk_size: total_chunk_size, bytes_downloaded: downloaded_for_this_thread,
+                });
+            }
+            Ok::<(), String>(())
+        }
+    });
+
+    // Run connections concurrently, STRICTLY limited to the user's thread count input
+    let stream = stream::iter(pending_futures).buffer_unordered(threads as usize);
+    let results: Vec<Result<(), String>> = stream.collect().await;
+
+    let mut error_msg = String::new();
+    for res in results {
+        if let Err(e) = res {
+            if error_msg.is_empty() { error_msg = e; }
+        }
     }
 
-    join_all(tasks).await;
+    if !error_msg.is_empty() {
+        if error_msg == "Paused by user" { return Err("Download Paused. Ready to Resume.".to_string()); }
+        return Err(error_msg);
+    }
 
-    Ok(format!("Successfully downloaded to {}", output))
+    let _ = std::fs::remove_file(&state_file_path);
+    Ok(format!("Saved to {}", file_path.display()))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        // Register our custom command here!
-        .invoke_handler(tauri::generate_handler![start_download])
+        .manage(AppState {
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+        })
+        .invoke_handler(tauri::generate_handler![start_download, stop_download]) // Registered Stop Command
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
