@@ -1,0 +1,53 @@
+# macOS
+.DS_Store
+
+# Rust
+**/target/
+
+# Keep Cargo.lock for applications
+#! Cargo.lock
+
+# Rustfmt backups
+**/*.rs.bk
+
+# Environment
+.env
+.env.*
+
+# Logs
+*.log
+
+# IDEs
+.vscode/
+.idea/
+.vs/
+*.iml
+
+# Vim/Emacs
+*.swp
+*.swo
+*~
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Coverage
+coverage/
+*.profraw
+*.profdata
+
+# Generated docs
+doc/
+
+# Benchmarks
+criterion/
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary files
+tmp/
+temp/
