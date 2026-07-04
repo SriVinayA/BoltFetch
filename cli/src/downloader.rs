@@ -53,7 +53,7 @@ impl<H: HttpFetcher + 'static, F: FileWriter + 'static, P: ProgressTracker + 'st
             // But wait, the trait says ThreadProgress: Send + Sync. So Box<dyn ThreadProgress> is just that, but wait, it should be Box<dyn ThreadProgress + Send + Sync> to be safe in async move.
             // Oh, since the trait definition has `trait ThreadProgress: Send + Sync`, returning `Box<dyn ThreadProgress>` implies it might not have the bounds explicitly. Actually we should change the return type in the trait to `Box<dyn ThreadProgress>`. Wait, `dyn ThreadProgress` does NOT imply `Send`. 
             // It's safer to use `Box<dyn ThreadProgress>` if it doesn't cause issues, or just `let mut thread_progress = ...`. Let's see if rustc complains.
-            let mut thread_progress = self.progress.add_thread(i, size, start, end);
+            let thread_progress = self.progress.add_thread(i, size, start, end);
             
             let task = tokio::spawn(async move {
                 let mut response = http_clone.download_chunk(&url_clone, start, end).await.expect("Failed to get chunk");
