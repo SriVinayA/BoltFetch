@@ -4,8 +4,8 @@ use std::error::Error;
 use std::sync::Arc;
 
 pub trait FileWriter: Send + Sync {
-    fn pre_allocate(&self, size: u64) -> Result<(), Box<dyn Error>>;
-    fn write_at(&self, buf: &[u8], offset: u64) -> Result<usize, Box<dyn Error>>;
+    fn pre_allocate(&self, size: u64) -> Result<(), Box<dyn Error + Send + Sync>>;
+    fn write_at(&self, buf: &[u8], offset: u64) -> Result<usize, Box<dyn Error + Send + Sync>>;
 }
 
 pub struct LocalFileWriter {
@@ -13,7 +13,7 @@ pub struct LocalFileWriter {
 }
 
 impl LocalFileWriter {
-    pub fn new(path: &str) -> Result<Self, Box<dyn Error>> {
+    pub fn new(path: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let file = File::create(path)?;
         Ok(Self {
             file: Arc::new(file),
@@ -22,12 +22,12 @@ impl LocalFileWriter {
 }
 
 impl FileWriter for LocalFileWriter {
-    fn pre_allocate(&self, size: u64) -> Result<(), Box<dyn Error>> {
+    fn pre_allocate(&self, size: u64) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.file.set_len(size)?;
         Ok(())
     }
 
-    fn write_at(&self, buf: &[u8], offset: u64) -> Result<usize, Box<dyn Error>> {
+    fn write_at(&self, buf: &[u8], offset: u64) -> Result<usize, Box<dyn Error + Send + Sync>> {
         let bytes_written = self.file.write_at(buf, offset)?;
         Ok(bytes_written)
     }

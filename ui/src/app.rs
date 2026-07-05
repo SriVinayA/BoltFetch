@@ -17,7 +17,7 @@ extern "C" {
 struct DownloadArgs<'a> { url: &'a str, output: &'a str, threads: u64 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct ProgressPayload { pub thread_id: usize, pub chunk_size: u64, pub bytes_downloaded: u64 }
+pub struct ProgressPayload { pub chunk_id: usize, pub thread_id: usize, pub start: u64, pub current: u64, pub end: u64, pub thread_downloaded: u64, pub status: String }
 
 #[derive(Deserialize)]
 struct TauriEvent { payload: ProgressPayload }
@@ -50,7 +50,8 @@ pub fn App() -> impl IntoView {
     let (status, set_status) = signal(String::from("Ready to download."));
     let (is_downloading, set_is_downloading) = signal(false); // NEW: State Tracker
     
-    let (progress, set_progress) = signal(HashMap::<usize, ProgressPayload>::new());
+    let (chunks, set_chunks) = signal(HashMap::<usize, ProgressPayload>::new());
+    let (threads_map, set_threads_map) = signal(HashMap::<usize, ProgressPayload>::new());
     
     let (global_downloaded, set_global_downloaded) = signal(0u64);
     let (global_total, set_global_total) = signal(0u64);
@@ -63,11 +64,12 @@ pub fn App() -> impl IntoView {
     Effect::new(move |_| {
         let handler_progress = wasm_bindgen::closure::Closure::wrap(Box::new(move |event: JsValue| {
             if let Ok(tauri_event) = serde_wasm_bindgen::from_value::<TauriEvent>(event) {
-                set_progress.update(|map| {
-                    map.insert(tauri_event.payload.thread_id, tauri_event.payload);
+                let payload = tauri_event.payload;
+                set_chunks.update(|map| {
+                    map.insert(payload.chunk_id, payload.clone());
                     
-                    let current_total_bytes: u64 = map.values().map(|p| p.bytes_downloaded).sum();
-                    let current_total_size: u64 = map.values().map(|p| p.chunk_size).sum();
+                    let current_total_bytes: u64 = map.values().map(|p| p.current.saturating_sub(p.start)).sum();
+                    let current_total_size: u64 = map.values().map(|p| (p.end + 1).saturating_sub(p.start)).sum();
                     
                     set_global_downloaded.set(current_total_bytes);
                     set_global_total.set(current_total_size);
@@ -91,6 +93,10 @@ pub fn App() -> impl IntoView {
                         set_last_time.set(now);
                         set_last_bytes.set(current_total_bytes);
                     }
+                });
+                
+                set_threads_map.update(|map| {
+                    map.insert(payload.thread_id, payload);
                 });
             }
         }) as Box<dyn FnMut(JsValue)>);
@@ -128,7 +134,8 @@ pub fn App() -> impl IntoView {
                 
                 // --- THE AUTONOMOUS ORCHESTRATOR LOOP ---
                 loop {
-                    set_progress.set(HashMap::new()); 
+                    set_chunks.set(HashMap::new()); 
+                    set_threads_map.set(HashMap::new());
                     set_global_downloaded.set(0);
                     set_global_total.set(0);
                     set_speed.set(0.0);
@@ -219,9 +226,7 @@ pub fn App() -> impl IntoView {
     };
 
     view! {
-        <main style="padding: 2rem; font-family: system-ui, sans-serif; display: flex; flex-direction: column; gap: 0.8rem; max-width: 550px; margin: 0 auto; background: #1e1e1e; color: white; height: 100vh;">
-            <crate::components::Header />
-            
+        <main style="padding: max(1rem, 3vw); font-family: system-ui, sans-serif; display: flex; flex-direction: column; gap: 0.8rem; max-width: 800px; width: 100%; box-sizing: border-box; margin: 0 auto; background: #1e1e1e; color: white; height: 100vh;">
             <crate::components::ConfigForm 
                 url=url set_url=set_url
                 output=output set_output=set_output
@@ -240,7 +245,8 @@ pub fn App() -> impl IntoView {
                 eta=eta
             />
 
-            <crate::components::ThreadProgressList progress=progress />
+            <crate::components::UnifiedSegmentBar chunks=chunks global_total=global_total />
+            <crate::components::ConnectionsTable threads_map=threads_map />
         </main>
     }
 }

@@ -1,11 +1,15 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ProgressPayload {
+    pub chunk_id: usize,
     pub thread_id: usize,
-    pub chunk_size: u64,
-    pub bytes_downloaded: u64,
+    pub start: u64,
+    pub current: u64,
+    pub end: u64,
+    pub thread_downloaded: u64,
+    pub status: String,
 }
 
 pub trait EventEmitter: Send + Sync {

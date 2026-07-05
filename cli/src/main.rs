@@ -3,6 +3,7 @@ mod downloader;
 mod file_io;
 mod http;
 mod progress;
+mod state;
 
 use clap::Parser;
 use config::Args;
@@ -14,7 +15,7 @@ use std::error::Error;
 use std::sync::Arc;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args = Args::parse();
     
     let http = Arc::new(ReqwestFetcher::new());

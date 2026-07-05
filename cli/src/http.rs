@@ -3,9 +3,9 @@ use reqwest::header::{CONTENT_LENGTH, RANGE};
 use std::error::Error;
 
 pub trait HttpFetcher: Send + Sync {
-    fn get_content_length(&self, url: &str) -> impl std::future::Future<Output = Result<u64, Box<dyn Error>>> + Send;
-    fn check_range_support(&self, url: &str) -> impl std::future::Future<Output = Result<bool, Box<dyn Error>>> + Send;
-    fn download_chunk(&self, url: &str, start: u64, end: u64) -> impl std::future::Future<Output = Result<reqwest::Response, Box<dyn Error>>> + Send;
+    fn get_content_length(&self, url: &str) -> impl std::future::Future<Output = Result<u64, Box<dyn Error + Send + Sync>>> + Send;
+    fn check_range_support(&self, url: &str) -> impl std::future::Future<Output = Result<bool, Box<dyn Error + Send + Sync>>> + Send;
+    fn download_chunk(&self, url: &str, start: u64, end: u64) -> impl std::future::Future<Output = Result<reqwest::Response, Box<dyn Error + Send + Sync>>> + Send;
 }
 
 pub struct ReqwestFetcher {
@@ -14,14 +14,21 @@ pub struct ReqwestFetcher {
 
 impl ReqwestFetcher {
     pub fn new() -> Self {
+        let client = Client::builder()
+            .tcp_nodelay(true)
+            .pool_max_idle_per_host(32)
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .build()
+            .expect("Failed to build HTTP client");
+            
         Self {
-            client: Client::new(),
+            client,
         }
     }
 }
 
 impl HttpFetcher for ReqwestFetcher {
-    async fn get_content_length(&self, url: &str) -> Result<u64, Box<dyn Error>> {
+    async fn get_content_length(&self, url: &str) -> Result<u64, Box<dyn Error + Send + Sync>> {
         let head_res = self.client.head(url).send().await?;
         let content_length = head_res
             .headers()
@@ -32,7 +39,7 @@ impl HttpFetcher for ReqwestFetcher {
         Ok(content_length)
     }
 
-    async fn check_range_support(&self, url: &str) -> Result<bool, Box<dyn Error>> {
+    async fn check_range_support(&self, url: &str) -> Result<bool, Box<dyn Error + Send + Sync>> {
         let range_check = self.client
             .get(url)
             .header(RANGE, "bytes=0-0")
@@ -41,7 +48,7 @@ impl HttpFetcher for ReqwestFetcher {
         Ok(range_check.status() == StatusCode::PARTIAL_CONTENT)
     }
 
-    async fn download_chunk(&self, url: &str, start: u64, end: u64) -> Result<reqwest::Response, Box<dyn Error>> {
+    async fn download_chunk(&self, url: &str, start: u64, end: u64) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
         let range_header = format!("bytes={}-{}", start, end);
         let response = self.client
             .get(url)

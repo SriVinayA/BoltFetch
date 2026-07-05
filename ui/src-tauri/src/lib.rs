@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 
-#[derive(Clone, Serialize)]
-struct ProgressPayload { thread_id: usize, chunk_size: u64, bytes_downloaded: u64 }
+#[derive(Clone, Serialize, Deserialize)]
+struct ProgressPayload { chunk_id: usize, thread_id: usize, start: u64, current: u64, end: u64, thread_downloaded: u64, status: String }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct ChunkState { id: usize, start: u64, current: u64, end: u64 }
@@ -107,9 +107,13 @@ async fn start_download(
 
     for chunk in &download_state.chunks {
         let _ = app.emit("download-progress", ProgressPayload {
+            chunk_id: chunk.id,
             thread_id: chunk.id,
-            chunk_size: chunk.end - chunk.start + 1,
-            bytes_downloaded: chunk.current.saturating_sub(chunk.start),
+            start: chunk.start,
+            current: chunk.current,
+            end: chunk.end,
+            thread_downloaded: chunk.current.saturating_sub(chunk.start),
+            status: "Initializing...".to_string(),
         });
     }
 
@@ -135,7 +139,6 @@ async fn start_download(
         let state_file_path_clone = state_file_path.clone();
 
         async move {
-            let total_chunk_size = chunk.end - chunk.start + 1;
             let range_header = format!("bytes={}-{}", chunk.current, chunk.end);
             
             let mut response = client_clone.get(&url_clone).header(RANGE, range_header).send().await
@@ -169,7 +172,13 @@ async fn start_download(
                 }
 
                 let _ = app_clone.emit("download-progress", ProgressPayload {
-                    thread_id: chunk.id, chunk_size: total_chunk_size, bytes_downloaded: downloaded_for_this_thread,
+                    chunk_id: chunk.id,
+                    thread_id: chunk.id,
+                    start: chunk.start,
+                    current: current_offset,
+                    end: chunk.end,
+                    thread_downloaded: downloaded_for_this_thread,
+                    status: "Receiving data...".to_string(),
                 });
             }
             Ok::<(), String>(())

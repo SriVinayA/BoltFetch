@@ -61,10 +61,11 @@ Downloads can be safely interrupted at any time.
 
 #### Desktop UI
 
-- Native desktop application
-- Built with **Tauri v2**
-- Modern UI powered by **Leptos**
-- Dark mode support
+- Native desktop application built with **Tauri v2**
+- Modern, responsive UI powered by **Leptos**
+- **IDM-inspired segment progression bar** (visualizes chunk boundaries and live downloads)
+- **Real-time active connection tracking table**
+- Premium dark mode with glassmorphic aesthetics
 
 ---
 
@@ -212,13 +213,11 @@ This produces native desktop applications for your platform:
 
 Unlike traditional download managers that use a fixed number of threads, BoltFetch continuously adapts to server conditions.
 
-## 1. Initial Download
+## 1. Dynamic Multipart Work Stealing
 
 The download begins using the maximum number of worker threads specified by the user.
 
-```text
-Threads: 8
-```
+Unlike static chunking, BoltFetch uses an adaptive work-stealing queue. When a worker thread finishes its chunk (or is idle), it queries the active download state, finds the largest actively downloading chunk, and dynamically splits it in half. The thread immediately begins downloading the new second half. This guarantees that all threads are fully utilized until the very last byte is fetched.
 
 ---
 
@@ -246,11 +245,16 @@ No user intervention is required.
 
 ---
 
-## 4. Persistent Chunk Tracking
+## 4. Asynchronous Non-Blocking Disk I/O
 
-Each completed chunk is immediately written to disk.
+To prevent slow disk writing speeds from bottle-necking fast internet connections, BoltFetch uses buffered concurrent writes.
+Each thread buffers incoming network data into memory (up to 2MB). Once the threshold is reached, the buffer is handed off to a dedicated background task for writing. By using OS-level positioned writes (`write_at`), multiple threads write to the exact same file simultaneously at different byte offsets without needing file locks.
 
-Progress is continuously stored inside a `.boltfetch` state file.
+---
+
+## 5. Persistent Chunk Tracking
+
+Every time a buffer is flushed to disk, the progress is continuously stored inside a `.boltfetch` state file.
 
 If the application:
 
@@ -259,15 +263,7 @@ If the application:
 - loses power
 - or the system reboots
 
-BoltFetch resumes exactly where it left off.
-
-Completed chunks are never downloaded again.
-
----
-
-## 5. Completion
-
-Whenever a worker finishes downloading a chunk, it immediately requests the next pending chunk until the entire file has been downloaded.
+BoltFetch resumes exactly where it left off. Completed chunks are never downloaded again.
 
 ---
 

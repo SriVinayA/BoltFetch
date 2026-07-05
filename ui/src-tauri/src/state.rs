@@ -44,21 +44,12 @@ impl StateManager {
         }
 
         if !is_resume {
-            let chunk_size = content_length / threads;
-            for i in 0..(threads as usize) {
-                let start = (i as u64) * chunk_size;
-                let end = if i == (threads as usize) - 1 {
-                    content_length - 1
-                } else {
-                    (i as u64 + 1) * chunk_size - 1
-                };
-                download_state.chunks.push(ChunkState {
-                    id: i,
-                    start,
-                    current: start,
-                    end,
-                });
-            }
+            download_state.chunks.push(ChunkState {
+                id: 0,
+                start: 0,
+                current: 0,
+                end: if content_length > 0 { content_length - 1 } else { 0 },
+            });
         }
 
         (download_state, is_resume)
