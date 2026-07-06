@@ -71,12 +71,13 @@ impl<H: HttpFetcher + 'static, F: FileWriter + 'static, P: ProgressTracker + 'st
         }
     }
 
-    pub async fn download(&self, url: &str, num_threads: u64) -> Result<(), Box<dyn Error + Send + Sync>> {
+    pub async fn download(&self, url: &str, mut num_threads: u64) -> Result<(), Box<dyn Error + Send + Sync>> {
         let content_length = self.http.get_content_length(url).await?;
         
-        if !self.http.check_range_support(url).await? {
-            println!("Server does not support multipart downloads.");
-            return Ok(());
+        let supports_range = self.http.check_range_support(url).await?;
+        if !supports_range {
+            println!("Server does not support multipart downloads. Falling back to single thread.");
+            num_threads = 1;
         }
 
         println!("File size: {} bytes. Starting download with {} threads...\n", content_length, num_threads);
@@ -84,7 +85,7 @@ impl<H: HttpFetcher + 'static, F: FileWriter + 'static, P: ProgressTracker + 'st
         self.file.pre_allocate(content_length)?;
 
         let state_file_path = Path::new("download.boltfetch");
-        let (download_state, _is_resume) = StateManager::load_or_init(state_file_path, url, content_length);
+        let (download_state, _is_resume) = StateManager::load_or_init(state_file_path, url, content_length, supports_range);
 
         let shared_state = Arc::new(tokio::sync::Mutex::new(ActiveState {
             download_state,

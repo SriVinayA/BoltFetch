@@ -23,6 +23,7 @@ impl StateManager {
         state_file_path: &Path,
         url: &str,
         content_length: u64,
+        supports_range: bool,
     ) -> (DownloadState, bool) {
         let mut download_state = DownloadState {
             url: url.to_string(),
@@ -31,7 +32,7 @@ impl StateManager {
         };
         let mut is_resume = false;
 
-        if state_file_path.exists() {
+        if supports_range && state_file_path.exists() {
             if let Ok(content) = std::fs::read_to_string(state_file_path) {
                 if let Ok(parsed) = serde_json::from_str::<DownloadState>(&content) {
                     if parsed.url == url && parsed.total_size == content_length {

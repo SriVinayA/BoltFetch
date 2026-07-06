@@ -245,14 +245,26 @@ No user intervention is required.
 
 ---
 
-## 4. Asynchronous Non-Blocking Disk I/O
+## 4. Single-Threaded Fallback for Legacy Servers
+
+Not all servers support advanced features like `Range` headers for multipart downloading. When BoltFetch detects a server that doesn't support chunked downloads, it seamlessly:
+
+- Falls back to a robust single-threaded download mode
+- Captures the total file size directly from the full response
+- Completes the download using standard streaming
+
+This ensures universal compatibility while still retaining all smart file detection features.
+
+---
+
+## 5. Asynchronous Non-Blocking Disk I/O
 
 To prevent slow disk writing speeds from bottle-necking fast internet connections, BoltFetch uses buffered concurrent writes.
 Each thread buffers incoming network data into memory (up to 2MB). Once the threshold is reached, the buffer is handed off to a dedicated background task for writing. By using OS-level positioned writes (`write_at`), multiple threads write to the exact same file simultaneously at different byte offsets without needing file locks.
 
 ---
 
-## 5. Persistent Chunk Tracking
+## 6. Persistent Chunk Tracking
 
 Every time a buffer is flushed to disk, the progress is continuously stored inside a `.boltfetch` state file.
 
@@ -298,6 +310,7 @@ BoltFetch resumes exactly where it left off. Completed chunks are never download
 - 🔄 Automatic resume support
 - 💾 Persistent download state
 - 🚫 Intelligent rate-limit recovery
+- 🛡️ Single-threaded fallback for legacy servers
 - 📄 Smart filename detection
 - 🖥️ Native desktop application
 - 🦀 Written entirely in Rust

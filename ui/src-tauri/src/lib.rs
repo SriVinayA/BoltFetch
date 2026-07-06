@@ -47,8 +47,10 @@ async fn start_download(
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
     let range_check = client.get(&url).header(RANGE, "bytes=0-0").send().await.map_err(|e| format!("Network error: {}", e))?;
-    if range_check.status() != StatusCode::PARTIAL_CONTENT {
-        return Err("Server does not support multipart downloads. Cannot resume.".into());
+    let supports_range = range_check.status() == StatusCode::PARTIAL_CONTENT;
+    
+    if !supports_range && range_check.status() != StatusCode::OK {
+        return Err(format!("Server returned HTTP {}", range_check.status()));
     }
 
     let mut final_filename = output.clone();
@@ -70,9 +72,15 @@ async fn start_download(
     }
     let _ = app.emit("filename-resolved", final_filename.clone());
 
-    let content_length: u64 = range_check.headers().get(CONTENT_RANGE)
-        .and_then(|v| v.to_str().ok()).ok_or("No Content-Range header")?
-        .split('/').last().and_then(|s| s.parse().ok()).ok_or("Failed to parse size")?;
+    let content_length: u64 = if supports_range {
+        range_check.headers().get(CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok()).ok_or("No Content-Range header")?
+            .split('/').last().and_then(|s| s.parse().ok()).ok_or("Failed to parse size")?
+    } else {
+        range_check.headers().get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok()).unwrap_or(0)
+    };
 
     let mut file_path = dirs::download_dir().ok_or("Could not find Downloads directory")?;
     file_path.push(&final_filename);
@@ -81,7 +89,7 @@ async fn start_download(
     let mut download_state = DownloadState { url: url.clone(), total_size: content_length, chunks: Vec::new() };
     let mut is_resume = false;
 
-    if state_file_path.exists() {
+    if supports_range && state_file_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&state_file_path) {
             if let Ok(parsed) = serde_json::from_str::<DownloadState>(&content) {
                 if parsed.url == url && parsed.total_size == content_length {
@@ -92,11 +100,13 @@ async fn start_download(
         }
     }
 
+    let actual_threads = if supports_range { threads } else { 1 };
+
     if !is_resume {
-        let chunk_size = content_length / threads;
-        for i in 0..(threads as usize) {
+        let chunk_size = if actual_threads > 0 && content_length > 0 { content_length / actual_threads } else { 0 };
+        for i in 0..(actual_threads as usize) {
             let start = (i as u64) * chunk_size;
-            let end = if i == (threads as usize) - 1 { content_length - 1 } else { (i as u64 + 1) * chunk_size - 1 };
+            let end = if i == (actual_threads as usize) - 1 { if content_length > 0 { content_length - 1 } else { 0 } } else { (i as u64 + 1) * chunk_size - 1 };
             download_state.chunks.push(ChunkState { id: i, start, current: start, end });
         }
         let file = File::create(&file_path).map_err(|e| format!("Failed to create file: {}", e))?;
