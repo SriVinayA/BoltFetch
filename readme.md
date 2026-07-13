@@ -109,8 +109,10 @@ xattr -cr /Applications/BoltFetch.app
 
 ```text
 BoltFetch/
+├── core/       # Shared download logic (boltfetch-core)
 ├── cli/        # Command-line application
 └── ui/         # Tauri + Leptos desktop application
+
 ```
 
 ---

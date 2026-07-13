@@ -93,15 +93,26 @@ pub fn UnifiedSegmentBar(
                     }
                     
                     let mut chunk_list: Vec<_> = chunks.get().into_values().collect();
-                    chunk_list.sort_by_key(|c| c.chunk_id);
+                    chunk_list.sort_by_key(|c| c.start);
                     
-                    chunk_list.into_iter().map(|c| {
+                    chunk_list.into_iter().enumerate().map(|(i, c)| {
+                        // Deduce true_end from the next chunk's start to avoid overlapping stale payloads
+                        // The last chunk's end is always total - 1
+                        let true_end = if i + 1 < chunks.get().len() {
+                            let mut peek = chunks.get().into_values().collect::<Vec<_>>();
+                            peek.sort_by_key(|p| p.start);
+                            peek[i + 1].start - 1
+                        } else {
+                            total as u64 - 1
+                        };
+
                         let left = (c.start as f64 / total) * 100.0;
-                        let width = ((c.end as f64 + 1.0 - c.start as f64) / total) * 100.0;
+                        let width = ((true_end as f64 + 1.0 - c.start as f64) / total) * 100.0;
                         
-                        let chunk_total = c.end as f64 + 1.0 - c.start as f64;
+                        let chunk_total = true_end as f64 + 1.0 - c.start as f64;
                         let downloaded = c.current as f64 - c.start as f64;
-                        let inner_percent = if chunk_total <= 0.0 { 0.0 } else { (downloaded / chunk_total) * 100.0 };
+                        // clamp to 100% just in case of slight timing mismatches
+                        let inner_percent = if chunk_total <= 0.0 { 0.0 } else { ((downloaded / chunk_total) * 100.0).min(100.0) };
                         
                         view! {
                             <div style=format!("position: absolute; left: {}%; width: {}%; height: 100%; border-right: 1px solid rgba(255,255,255,0.2); box-sizing: border-box;", left, width)>

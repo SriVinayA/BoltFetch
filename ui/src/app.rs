@@ -69,7 +69,8 @@ pub fn App() -> impl IntoView {
                     map.insert(payload.chunk_id, payload.clone());
                     
                     let current_total_bytes: u64 = map.values().map(|p| p.current.saturating_sub(p.start)).sum();
-                    let current_total_size: u64 = map.values().map(|p| (p.end + 1).saturating_sub(p.start)).sum();
+                    let max_end = map.values().map(|p| p.end).max().unwrap_or(0);
+                    let current_total_size: u64 = if max_end > 0 { max_end + 1 } else { 0 };
                     
                     set_global_downloaded.set(current_total_bytes);
                     set_global_total.set(current_total_size);

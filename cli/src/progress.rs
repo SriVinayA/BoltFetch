@@ -1,17 +1,12 @@
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-
-pub trait ProgressTracker: Send + Sync {
-    fn add_thread(&self, thread_id: u64, size: u64, start: u64, end: u64) -> Box<dyn ThreadProgress + Send + Sync>;
-}
-
-pub trait ThreadProgress: Send + Sync {
-    fn inc(&self, delta: u64);
-    fn finish(&self, msg: String);
-}
+use std::sync::Mutex;
+use std::collections::HashMap;
+use boltfetch_core::events::{ProgressEmitter, ProgressPayload};
 
 pub struct IndicatifTracker {
     multi_progress: MultiProgress,
     style: ProgressStyle,
+    bars: Mutex<HashMap<usize, ProgressBar>>,
 }
 
 impl IndicatifTracker {
@@ -23,29 +18,36 @@ impl IndicatifTracker {
         Self {
             multi_progress: MultiProgress::new(),
             style,
+            bars: Mutex::new(HashMap::new()),
         }
     }
 }
 
-pub struct IndicatifThread {
-    pb: ProgressBar,
-}
-
-impl ThreadProgress for IndicatifThread {
-    fn inc(&self, delta: u64) {
-        self.pb.inc(delta);
+impl ProgressEmitter for IndicatifTracker {
+    fn emit_progress(&self, payload: ProgressPayload) {
+        let mut bars = self.bars.lock().unwrap();
+        
+        // If we haven't created a progress bar for this chunk yet, create one
+        let pb = bars.entry(payload.chunk_id).or_insert_with(|| {
+            let size = payload.end - payload.start + 1;
+            let pb = self.multi_progress.add(ProgressBar::new(size));
+            pb.set_style(self.style.clone());
+            pb.set_message(format!("Thread {} (bytes {}-{})", payload.thread_id, payload.start, payload.end));
+            pb
+        });
+        
+        pb.set_position(payload.current - payload.start);
+        
+        if payload.current >= payload.end {
+            pb.finish_with_message(format!("Thread {} - Complete!", payload.thread_id));
+        }
     }
 
-    fn finish(&self, msg: String) {
-        self.pb.finish_with_message(msg);
+    fn emit_filename_resolved(&self, filename: String) {
+        println!("Downloading to: {}", filename);
     }
-}
-
-impl ProgressTracker for IndicatifTracker {
-    fn add_thread(&self, thread_id: u64, size: u64, start: u64, end: u64) -> Box<dyn ThreadProgress + Send + Sync> {
-        let pb = self.multi_progress.add(ProgressBar::new(size));
-        pb.set_style(self.style.clone());
-        pb.set_message(format!("Thread {} (bytes {}-{})", thread_id, start, end));
-        Box::new(IndicatifThread { pb })
+    
+    fn emit_log(&self, msg: String) {
+        println!("{}", msg);
     }
 }

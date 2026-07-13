@@ -1,17 +1,12 @@
 [package]
-name = "cli"
+name = "boltfetch-core"
 version = "0.2.2"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-axum = "0.8.9"
-clap = { version = "4.6.1", features = ["derive"] }
 futures = "0.3.32"
-indicatif = "0.18.6"
 reqwest = "0.13.4"
 tokio = { version = "1.52.3", features = ["full"] }
 bytes = "1.5.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-boltfetch-core = { path = "../core" }
-
