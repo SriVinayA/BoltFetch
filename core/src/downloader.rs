@@ -15,6 +15,7 @@ use tokio::sync::oneshot;
 use std::sync::atomic::AtomicU64;
 use std::collections::HashMap;
 
+#[allow(dead_code)]
 pub enum StateMessage {
     RequestWork {
         reply: oneshot::Sender<Option<(ChunkState, Arc<AtomicU64>)>>,
@@ -29,12 +30,14 @@ pub enum StateMessage {
     SaveStateNow,
 }
 
+#[allow(dead_code)]
 pub struct StateManagerTask {
     pub download_state: DownloadState,
     pub active_chunks: HashMap<usize, Arc<AtomicU64>>,
     pub state_file_path: PathBuf,
 }
 
+#[allow(dead_code)]
 impl StateManagerTask {
     fn get_work(&mut self) -> Option<(ChunkState, Arc<AtomicU64>)> {
         // Find a pending chunk that isn't active
