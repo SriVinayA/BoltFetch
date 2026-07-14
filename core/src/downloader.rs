@@ -258,7 +258,9 @@ impl Downloader {
                 
                 match msg {
                     StateMessage::RequestWork { reply } => {
-                        let _ = reply.send(sm_task.get_work());
+                        if let Err(_) = reply.send(sm_task.get_work()) {
+                            eprintln!("Error: failed to send RequestWork reply");
+                        }
                         needs_save = true;
                     }
                     StateMessage::UpdateProgress { chunk_id, current } => {
@@ -276,12 +278,16 @@ impl Downloader {
                 }
 
                 if needs_save || last_save.elapsed() >= save_interval {
-                    let _ = StateManager::save(&sm_task.state_file_path, &sm_task.download_state);
+                    if let Err(e) = StateManager::save(&sm_task.state_file_path, &sm_task.download_state) {
+                        eprintln!("Error: failed to save state: {}", e);
+                    }
                     last_save = std::time::Instant::now();
                 }
             }
             // Final save on shutdown
-            let _ = StateManager::save(&sm_task.state_file_path, &sm_task.download_state);
+            if let Err(e) = StateManager::save(&sm_task.state_file_path, &sm_task.download_state) {
+                eprintln!("Error: failed to save state on shutdown: {}", e);
+            }
         });
 
         let file = std::fs::OpenOptions::new().write(true).open(&file_path).map_err(|e| format!("Failed to open file: {}", e))?;
