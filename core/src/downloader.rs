@@ -317,15 +317,29 @@ impl Downloader {
                         let f = file_clone.clone();
                         let offset = current_offset;
                         
-                        let bytes_written = tokio::task::spawn_blocking(move || {
+                        let write_result = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
                             let mut chunk_offset = 0;
                             while chunk_offset < chunk_bytes.len() {
-                                let written = f.write_at(&chunk_bytes[chunk_offset..], offset + chunk_offset as u64).unwrap_or(0);
-                                if written == 0 { break; } // prevent infinite loop on err
+                                let written = f.write_at(&chunk_bytes[chunk_offset..], offset + chunk_offset as u64)?;
+                                if written == 0 {
+                                    return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "Failed to write whole buffer"));
+                                }
                                 chunk_offset += written;
                             }
-                            chunk_offset as u64
-                        }).await.unwrap_or(0);
+                            Ok(chunk_offset as u64)
+                        }).await;
+
+                        let bytes_written = match write_result {
+                            Ok(Ok(bw)) => bw,
+                            Ok(Err(e)) => {
+                                *err_flag.lock().await = format!("Disk I/O error: {}", e);
+                                break;
+                            },
+                            Err(e) => {
+                                *err_flag.lock().await = format!("Task join error: {}", e);
+                                break;
+                            }
+                        };
 
                         current_offset += bytes_written;
                         downloaded_for_this_thread += bytes_written;
