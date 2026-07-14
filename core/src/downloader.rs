@@ -179,6 +179,7 @@ impl Downloader {
                 start: chunk.start,
                 current: chunk.current,
                 end: chunk.end,
+                total_size: content_length,
                 thread_downloaded: chunk.current.saturating_sub(chunk.start),
                 status: "Initializing...".to_string(),
             });
@@ -250,6 +251,7 @@ impl Downloader {
             let cancel_flag_clone = cancel_flag.clone();
             let err_flag = generic_error_flag.clone();
             let rl_hits = rate_limit_hits.clone();
+            let thread_content_length = content_length;
 
             let task = tokio::spawn(async move {
                 loop {
@@ -355,6 +357,7 @@ impl Downloader {
                             start: chunk.start,
                             current: current_offset,
                             end: atomic_end.load(Ordering::Relaxed),
+                            total_size: thread_content_length,
                             thread_downloaded: downloaded_for_this_thread,
                             status: "Receiving data...".to_string(),
                         });

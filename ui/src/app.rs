@@ -17,7 +17,7 @@ extern "C" {
 struct DownloadArgs<'a> { url: &'a str, output: &'a str, threads: u64 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct ProgressPayload { pub chunk_id: usize, pub thread_id: usize, pub start: u64, pub current: u64, pub end: u64, pub thread_downloaded: u64, pub status: String }
+pub struct ProgressPayload { pub chunk_id: usize, pub thread_id: usize, pub start: u64, pub current: u64, pub end: u64, pub total_size: u64, pub thread_downloaded: u64, pub status: String }
 
 #[derive(Deserialize)]
 struct TauriEvent { payload: ProgressPayload }
@@ -69,8 +69,7 @@ pub fn App() -> impl IntoView {
                     map.insert(payload.chunk_id, payload.clone());
                     
                     let current_total_bytes: u64 = map.values().map(|p| p.current.saturating_sub(p.start)).sum();
-                    let max_end = map.values().map(|p| p.end).max().unwrap_or(0);
-                    let current_total_size: u64 = if max_end > 0 { max_end + 1 } else { 0 };
+                    let current_total_size = payload.total_size;
                     
                     set_global_downloaded.set(current_total_bytes);
                     set_global_total.set(current_total_size);

@@ -7,6 +7,7 @@ pub struct ProgressPayload {
     pub start: u64,
     pub current: u64,
     pub end: u64,
+    pub total_size: u64,
     pub thread_downloaded: u64,
     pub status: String,
 }
