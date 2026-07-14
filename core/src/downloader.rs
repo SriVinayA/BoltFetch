@@ -11,6 +11,82 @@ use std::collections::HashSet;
 use crate::events::{ProgressEmitter, ProgressPayload};
 use crate::state::{ChunkState, StateManager, DownloadState};
 
+use tokio::sync::oneshot;
+use std::sync::atomic::AtomicU64;
+use std::collections::HashMap;
+
+pub enum StateMessage {
+    RequestWork {
+        reply: oneshot::Sender<Option<(ChunkState, Arc<AtomicU64>)>>,
+    },
+    UpdateProgress {
+        chunk_id: usize,
+        current: u64,
+    },
+    ChunkComplete {
+        chunk_id: usize,
+    },
+    SaveStateNow,
+}
+
+pub struct StateManagerTask {
+    pub download_state: DownloadState,
+    pub active_chunks: HashMap<usize, Arc<AtomicU64>>,
+    pub state_file_path: PathBuf,
+}
+
+impl StateManagerTask {
+    fn get_work(&mut self) -> Option<(ChunkState, Arc<AtomicU64>)> {
+        // Find a pending chunk that isn't active
+        if let Some(c) = self.download_state.chunks.iter().find(|c| !self.active_chunks.contains_key(&c.id) && c.current <= c.end) {
+            let end_atomic = Arc::new(AtomicU64::new(c.end));
+            self.active_chunks.insert(c.id, end_atomic.clone());
+            return Some((c.clone(), end_atomic));
+        }
+
+        let min_chunk_size = 1024 * 1024; // 1 MB
+        let mut largest_idx = None;
+        let mut max_remaining = 0;
+
+        for (i, c) in self.download_state.chunks.iter().enumerate() {
+            if c.current <= c.end {
+                let remaining = c.end - c.current;
+                if remaining > max_remaining && remaining >= min_chunk_size * 2 {
+                    max_remaining = remaining;
+                    largest_idx = Some(i);
+                }
+            }
+        }
+
+        if let Some(idx) = largest_idx {
+            let next_id = self.download_state.chunks.iter().map(|c| c.id).max().unwrap_or(0) + 1;
+            let c = &mut self.download_state.chunks[idx];
+            let remaining = c.end - c.current;
+            let half = remaining / 2;
+            
+            let new_c = ChunkState {
+                id: next_id,
+                start: c.end - half + 1,
+                current: c.end - half + 1,
+                end: c.end,
+            };
+            c.end = c.end - half;
+            
+            // Atomically update the old chunk's end bound for the existing worker
+            if let Some(atomic_end) = self.active_chunks.get(&c.id) {
+                atomic_end.store(c.end, Ordering::Relaxed);
+            }
+            
+            let new_end_atomic = Arc::new(AtomicU64::new(new_c.end));
+            self.active_chunks.insert(new_c.id, new_end_atomic.clone());
+            self.download_state.chunks.push(new_c.clone());
+            return Some((new_c, new_end_atomic));
+        }
+
+        None
+    }
+}
+
 pub struct ActiveState {
     pub download_state: DownloadState,
     pub active_chunk_ids: HashSet<usize>,
