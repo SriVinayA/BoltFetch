@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::path::PathBuf;
 use futures::future::join_all;
-use std::collections::HashSet;
 
 use crate::events::{ProgressEmitter, ProgressPayload};
 use crate::state::{ChunkState, StateManager, DownloadState};
@@ -90,54 +89,7 @@ impl StateManagerTask {
     }
 }
 
-pub struct ActiveState {
-    pub download_state: DownloadState,
-    pub active_chunk_ids: HashSet<usize>,
-}
 
-impl ActiveState {
-    fn get_work(&mut self) -> Option<ChunkState> {
-        if let Some(c) = self.download_state.chunks.iter().find(|c| !self.active_chunk_ids.contains(&c.id) && c.current <= c.end) {
-            self.active_chunk_ids.insert(c.id);
-            return Some(c.clone());
-        }
-
-        let min_chunk_size = 1024 * 1024; // 1 MB
-        let mut largest_idx = None;
-        let mut max_remaining = 0;
-
-        for (i, c) in self.download_state.chunks.iter().enumerate() {
-            if c.current <= c.end {
-                let remaining = c.end - c.current;
-                if remaining > max_remaining && remaining >= min_chunk_size * 2 {
-                    max_remaining = remaining;
-                    largest_idx = Some(i);
-                }
-            }
-        }
-
-        if let Some(idx) = largest_idx {
-            let next_id = self.download_state.chunks.iter().map(|c| c.id).max().unwrap_or(0) + 1;
-            let c = &mut self.download_state.chunks[idx];
-            let remaining = c.end - c.current;
-            let half = remaining / 2;
-            
-            let new_c = ChunkState {
-                id: next_id,
-                start: c.end - half + 1,
-                current: c.end - half + 1,
-                end: c.end,
-            };
-            c.end = c.end - half;
-            
-            self.active_chunk_ids.insert(new_c.id);
-            self.download_state.chunks.push(new_c.clone());
-            return Some(new_c);
-        }
-
-        None
-    }
-}
 
 pub struct Downloader {
     client: Client,
@@ -232,11 +184,6 @@ impl Downloader {
             });
         }
 
-        let shared_state = Arc::new(tokio::sync::Mutex::new(ActiveState {
-            download_state: download_state.clone(),
-            active_chunk_ids: HashSet::new(),
-        }));
-
         let (state_tx, mut state_rx) = tokio::sync::mpsc::channel::<StateMessage>(100);
         
         let mut sm_task = StateManagerTask {
@@ -244,10 +191,6 @@ impl Downloader {
             active_chunks: HashMap::new(),
             state_file_path: state_file_path.clone(),
         };
-
-        // Suppress unused variable warning for state_tx for now, it'll be used in Task 3.
-        #[allow(unused_variables)]
-        let sm_tx_clone = state_tx.clone();
         
         tokio::spawn(async move {
             let mut last_save = std::time::Instant::now();
@@ -303,9 +246,8 @@ impl Downloader {
             let file_clone = file_arc.clone();
             let url_clone = url.to_string();
             let progress_clone = self.progress.clone();
-            let shared_state_clone = shared_state.clone();
+            let state_tx_clone = state_tx.clone();
             let cancel_flag_clone = cancel_flag.clone();
-            let state_file_path_clone = state_file_path.clone();
             let err_flag = generic_error_flag.clone();
             let rl_hits = rate_limit_hits.clone();
 
@@ -316,87 +258,99 @@ impl Downloader {
                         break;
                     }
 
-                    let chunk = {
-                        let mut s = shared_state_clone.lock().await;
-                        match s.get_work() {
-                            Some(c) => c,
+                    let (chunk, atomic_end) = {
+                        let (reply_tx, reply_rx) = oneshot::channel();
+                        if state_tx_clone.send(StateMessage::RequestWork { reply: reply_tx }).await.is_err() {
+                            break;
+                        }
+                        match reply_rx.await.unwrap_or(None) {
+                            Some(work) => work,
                             None => break, // No more work
                         }
                     };
-
-                    let range_header = format!("bytes={}-{}", chunk.current, chunk.end);
-                    let mut response = match client_clone.get(&url_clone).header(RANGE, range_header).send().await {
-                        Ok(res) => res,
-                        Err(e) => {
-                            let mut s = shared_state_clone.lock().await;
-                            s.active_chunk_ids.remove(&chunk.id);
-                            *err_flag.lock().await = format!("Network error: {}", e);
-                            break;
-                        }
-                    };
-
-                    if response.status() == StatusCode::TOO_MANY_REQUESTS || response.status() == StatusCode::SERVICE_UNAVAILABLE {
-                        let mut s = shared_state_clone.lock().await;
-                        s.active_chunk_ids.remove(&chunk.id);
-                        rl_hits.fetch_add(1, Ordering::SeqCst);
-                        break;
-                    } else if !response.status().is_success() {
-                        let mut s = shared_state_clone.lock().await;
-                        s.active_chunk_ids.remove(&chunk.id);
-                        *err_flag.lock().await = format!("HTTP {}", response.status());
-                        break;
-                    }
+                    
+                    let mut retries = 0;
+                    let max_retries = 5;
 
                     let mut current_offset = chunk.current;
                     let mut downloaded_for_this_thread = chunk.current.saturating_sub(chunk.start);
 
-                    while let Some(chunk_bytes) = response.chunk().await.unwrap_or(None) {
+                    let response = loop {
+                        let range_header = format!("bytes={}-{}", current_offset, atomic_end.load(Ordering::Relaxed));
+                        match client_clone.get(&url_clone).header(RANGE, range_header).send().await {
+                            Ok(res) => {
+                                if res.status() == StatusCode::TOO_MANY_REQUESTS || res.status() == StatusCode::SERVICE_UNAVAILABLE {
+                                    if retries >= max_retries {
+                                        rl_hits.fetch_add(1, Ordering::SeqCst);
+                                        let _ = state_tx_clone.send(StateMessage::ChunkComplete { chunk_id: chunk.id }).await;
+                                        return; // Give up
+                                    }
+                                    retries += 1;
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(1 << retries)).await;
+                                    continue;
+                                } else if !res.status().is_success() {
+                                    *err_flag.lock().await = format!("HTTP {}", res.status());
+                                    let _ = state_tx_clone.send(StateMessage::ChunkComplete { chunk_id: chunk.id }).await;
+                                    return;
+                                }
+                                break res;
+                            },
+                            Err(e) => {
+                                if retries >= max_retries {
+                                    *err_flag.lock().await = format!("Network error: {}", e);
+                                    let _ = state_tx_clone.send(StateMessage::ChunkComplete { chunk_id: chunk.id }).await;
+                                    return;
+                                }
+                                retries += 1;
+                                tokio::time::sleep(tokio::time::Duration::from_secs(1 << retries)).await;
+                            }
+                        }
+                    };
+
+                    let mut chunk_stream = response;
+                    while let Some(chunk_bytes) = chunk_stream.chunk().await.unwrap_or(None) {
                         if cancel_flag_clone.load(Ordering::Relaxed) { 
                             *err_flag.lock().await = "Paused by user".to_string();
                             break; 
                         }
 
-                        let mut chunk_offset = 0;
-                        while chunk_offset < chunk_bytes.len() {
-                            let bytes_written = file_clone.write_at(&chunk_bytes[chunk_offset..], current_offset)
-                                .unwrap_or(0);
-                            chunk_offset += bytes_written;
-                            current_offset += bytes_written as u64;
-                            downloaded_for_this_thread += bytes_written as u64;
-                        }
-
-                        {
-                            let mut s = shared_state_clone.lock().await;
-                            if let Some(c) = s.download_state.chunks.iter_mut().find(|c| c.id == chunk.id) {
-                                c.current = current_offset;
+                        let f = file_clone.clone();
+                        let offset = current_offset;
+                        
+                        let bytes_written = tokio::task::spawn_blocking(move || {
+                            let mut chunk_offset = 0;
+                            while chunk_offset < chunk_bytes.len() {
+                                let written = f.write_at(&chunk_bytes[chunk_offset..], offset + chunk_offset as u64).unwrap_or(0);
+                                if written == 0 { break; } // prevent infinite loop on err
+                                chunk_offset += written;
                             }
-                            let _ = StateManager::save(&state_file_path_clone, &s.download_state);
-                        }
+                            chunk_offset as u64
+                        }).await.unwrap_or(0);
+
+                        current_offset += bytes_written;
+                        downloaded_for_this_thread += bytes_written;
+
+                        let _ = state_tx_clone.send(StateMessage::UpdateProgress { 
+                            chunk_id: chunk.id, 
+                            current: current_offset 
+                        }).await;
 
                         progress_clone.emit_progress(ProgressPayload {
                             chunk_id: chunk.id,
                             thread_id: thread_id as usize,
                             start: chunk.start,
                             current: current_offset,
-                            end: chunk.end,
+                            end: atomic_end.load(Ordering::Relaxed),
                             thread_downloaded: downloaded_for_this_thread,
                             status: "Receiving data...".to_string(),
                         });
                         
-                        let current_end = {
-                            let s = shared_state_clone.lock().await;
-                            s.download_state.chunks.iter().find(|c| c.id == chunk.id).map(|c| c.end).unwrap_or(chunk.end)
-                        };
-                        
-                        if current_offset >= current_end {
+                        if current_offset >= atomic_end.load(Ordering::Relaxed) {
                             break;
                         }
                     }
 
-                    {
-                        let mut s = shared_state_clone.lock().await;
-                        s.active_chunk_ids.remove(&chunk.id);
-                    }
+                    let _ = state_tx_clone.send(StateMessage::ChunkComplete { chunk_id: chunk.id }).await;
                     
                     let has_err = err_flag.lock().await.clone();
                     if !has_err.is_empty() {
@@ -408,6 +362,7 @@ impl Downloader {
             tasks.push(task);
         }
 
+        drop(state_tx);
         join_all(tasks).await;
 
         let err = generic_error_flag.lock().await.clone();
