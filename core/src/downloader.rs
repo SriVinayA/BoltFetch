@@ -233,9 +233,56 @@ impl Downloader {
         }
 
         let shared_state = Arc::new(tokio::sync::Mutex::new(ActiveState {
-            download_state,
+            download_state: download_state.clone(),
             active_chunk_ids: HashSet::new(),
         }));
+
+        let (state_tx, mut state_rx) = tokio::sync::mpsc::channel::<StateMessage>(100);
+        
+        let mut sm_task = StateManagerTask {
+            download_state,
+            active_chunks: HashMap::new(),
+            state_file_path: state_file_path.clone(),
+        };
+
+        // Suppress unused variable warning for state_tx for now, it'll be used in Task 3.
+        #[allow(unused_variables)]
+        let sm_tx_clone = state_tx.clone();
+        
+        tokio::spawn(async move {
+            let mut last_save = std::time::Instant::now();
+            let save_interval = std::time::Duration::from_millis(500);
+
+            while let Some(msg) = state_rx.recv().await {
+                let mut needs_save = false;
+                
+                match msg {
+                    StateMessage::RequestWork { reply } => {
+                        let _ = reply.send(sm_task.get_work());
+                        needs_save = true;
+                    }
+                    StateMessage::UpdateProgress { chunk_id, current } => {
+                        if let Some(c) = sm_task.download_state.chunks.iter_mut().find(|c| c.id == chunk_id) {
+                            c.current = current;
+                        }
+                    }
+                    StateMessage::ChunkComplete { chunk_id } => {
+                        sm_task.active_chunks.remove(&chunk_id);
+                        needs_save = true;
+                    }
+                    StateMessage::SaveStateNow => {
+                        needs_save = true;
+                    }
+                }
+
+                if needs_save || last_save.elapsed() >= save_interval {
+                    let _ = StateManager::save(&sm_task.state_file_path, &sm_task.download_state);
+                    last_save = std::time::Instant::now();
+                }
+            }
+            // Final save on shutdown
+            let _ = StateManager::save(&sm_task.state_file_path, &sm_task.download_state);
+        });
 
         let file = std::fs::OpenOptions::new().write(true).open(&file_path).map_err(|e| format!("Failed to open file: {}", e))?;
         let file_arc = Arc::new(file);
