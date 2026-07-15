@@ -223,7 +223,13 @@ Unlike static chunking, BoltFetch uses an adaptive work-stealing queue. When a w
 
 ---
 
-## 2. Detecting Rate Limits
+## 2. Lock-Free State Management
+
+To prevent threads from blocking each other on fast network connections, BoltFetch coordinates all download progress using an asynchronous, lock-free `mpsc` message channel. Worker threads never contend for a shared mutex, ensuring that the core engine can scale to massive concurrency with zero CPU throttling.
+
+---
+
+## 3. Detecting Rate Limits
 
 If the server responds with errors such as:
 
@@ -234,7 +240,7 @@ BoltFetch recognizes that the current level of concurrency is too aggressive.
 
 ---
 
-## 3. Automatic Recovery
+## 4. Automatic Recovery
 
 Instead of failing the download, BoltFetch:
 
@@ -247,7 +253,7 @@ No user intervention is required.
 
 ---
 
-## 4. Single-Threaded Fallback for Legacy Servers
+## 5. Single-Threaded Fallback for Legacy Servers
 
 Not all servers support advanced features like `Range` headers for multipart downloading. When BoltFetch detects a server that doesn't support chunked downloads, it seamlessly:
 
@@ -259,14 +265,14 @@ This ensures universal compatibility while still retaining all smart file detect
 
 ---
 
-## 5. Asynchronous Non-Blocking Disk I/O
+## 6. Asynchronous Non-Blocking Disk I/O
 
 To prevent slow disk writing speeds from bottle-necking fast internet connections, BoltFetch uses buffered concurrent writes.
 Each thread buffers incoming network data into memory (up to 2MB). Once the threshold is reached, the buffer is handed off to a dedicated background task for writing. By using OS-level positioned writes (`write_at`), multiple threads write to the exact same file simultaneously at different byte offsets without needing file locks.
 
 ---
 
-## 6. Persistent Chunk Tracking
+## 7. Persistent Chunk Tracking
 
 Every time a buffer is flushed to disk, the progress is continuously stored inside a `.boltfetch` state file.
 
