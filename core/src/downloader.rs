@@ -310,19 +310,79 @@ impl Downloader {
                     };
 
                     let mut chunk_stream = response;
+                    let mut buffer = Vec::with_capacity(2 * 1024 * 1024);
+                    let mut network_offset = current_offset;
+
                     while let Some(chunk_bytes) = chunk_stream.chunk().await.unwrap_or(None) {
                         if cancel_flag_clone.load(Ordering::Relaxed) { 
                             *err_flag.lock().await = "Paused by user".to_string();
                             break; 
                         }
 
+                        buffer.extend_from_slice(&chunk_bytes);
+                        network_offset += chunk_bytes.len() as u64;
+
+                        progress_clone.emit_progress(ProgressPayload {
+                            chunk_id: chunk.id,
+                            thread_id: thread_id as usize,
+                            start: chunk.start,
+                            current: network_offset,
+                            end: atomic_end.load(Ordering::Relaxed),
+                            total_size: thread_content_length,
+                            thread_downloaded: downloaded_for_this_thread + (network_offset - current_offset),
+                            status: "Receiving data...".to_string(),
+                        });
+
+                        if buffer.len() >= 2 * 1024 * 1024 || network_offset >= atomic_end.load(Ordering::Relaxed) {
+                            let f = file_clone.clone();
+                            let offset = current_offset;
+                            let data_to_write = std::mem::replace(&mut buffer, Vec::with_capacity(2 * 1024 * 1024));
+                            
+                            let write_result = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
+                                let mut chunk_offset = 0;
+                                while chunk_offset < data_to_write.len() {
+                                    let written = f.write_at(&data_to_write[chunk_offset..], offset + chunk_offset as u64)?;
+                                    if written == 0 {
+                                        return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "Failed to write whole buffer"));
+                                    }
+                                    chunk_offset += written;
+                                }
+                                Ok(chunk_offset as u64)
+                            }).await;
+
+                            let bytes_written = match write_result {
+                                Ok(Ok(bw)) => bw,
+                                Ok(Err(e)) => {
+                                    *err_flag.lock().await = format!("Disk I/O error: {}", e);
+                                    break;
+                                },
+                                Err(e) => {
+                                    *err_flag.lock().await = format!("Task join error: {}", e);
+                                    break;
+                                }
+                            };
+
+                            current_offset += bytes_written;
+                            downloaded_for_this_thread += bytes_written;
+
+                            let _ = state_tx_clone.send(StateMessage::UpdateProgress { 
+                                chunk_id: chunk.id, 
+                                current: current_offset 
+                            }).await;
+                        }
+                        
+                        if current_offset >= atomic_end.load(Ordering::Relaxed) {
+                            break;
+                        }
+                    }
+
+                    if !buffer.is_empty() && err_flag.lock().await.is_empty() {
                         let f = file_clone.clone();
                         let offset = current_offset;
-                        
                         let write_result = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
                             let mut chunk_offset = 0;
-                            while chunk_offset < chunk_bytes.len() {
-                                let written = f.write_at(&chunk_bytes[chunk_offset..], offset + chunk_offset as u64)?;
+                            while chunk_offset < buffer.len() {
+                                let written = f.write_at(&buffer[chunk_offset..], offset + chunk_offset as u64)?;
                                 if written == 0 {
                                     return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "Failed to write whole buffer"));
                                 }
@@ -330,40 +390,11 @@ impl Downloader {
                             }
                             Ok(chunk_offset as u64)
                         }).await;
-
-                        let bytes_written = match write_result {
-                            Ok(Ok(bw)) => bw,
-                            Ok(Err(e)) => {
-                                *err_flag.lock().await = format!("Disk I/O error: {}", e);
-                                break;
-                            },
-                            Err(e) => {
-                                *err_flag.lock().await = format!("Task join error: {}", e);
-                                break;
-                            }
-                        };
-
-                        current_offset += bytes_written;
-                        downloaded_for_this_thread += bytes_written;
-
-                        let _ = state_tx_clone.send(StateMessage::UpdateProgress { 
-                            chunk_id: chunk.id, 
-                            current: current_offset 
-                        }).await;
-
-                        progress_clone.emit_progress(ProgressPayload {
-                            chunk_id: chunk.id,
-                            thread_id: thread_id as usize,
-                            start: chunk.start,
-                            current: current_offset,
-                            end: atomic_end.load(Ordering::Relaxed),
-                            total_size: thread_content_length,
-                            thread_downloaded: downloaded_for_this_thread,
-                            status: "Receiving data...".to_string(),
-                        });
-                        
-                        if current_offset >= atomic_end.load(Ordering::Relaxed) {
-                            break;
+                        if let Ok(Ok(bw)) = write_result {
+                            let _ = state_tx_clone.send(StateMessage::UpdateProgress { 
+                                chunk_id: chunk.id, 
+                                current: current_offset + bw 
+                            }).await;
                         }
                     }
 
