@@ -48,7 +48,11 @@ impl StateManager {
                 id: 0,
                 start: 0,
                 current: 0,
-                end: if content_length > 0 { content_length - 1 } else { 0 },
+                end: if content_length > 0 {
+                    content_length - 1
+                } else {
+                    0
+                },
             });
         }
 

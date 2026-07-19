@@ -13,13 +13,13 @@ use boltfetch_core::downloader::Downloader;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args = Args::parse();
-    
+
     let progress = Arc::new(IndicatifTracker::new());
 
     let downloader = Downloader::new(progress)?;
-    
+
     let cancel_flag = Arc::new(AtomicBool::new(false));
-    
+
     // We handle SIGINT (Ctrl+C) to gracefully cancel the download
     let cancel_flag_clone = cancel_flag.clone();
     tokio::spawn(async move {
@@ -27,7 +27,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         cancel_flag_clone.store(true, Ordering::SeqCst);
     });
 
-    match downloader.download(&args.url, None, &args.output, args.threads, cancel_flag).await {
+    match downloader
+        .download(&args.url, None, &args.output, args.threads, cancel_flag)
+        .await
+    {
         Ok(msg) => println!("\nSuccess! {}", msg),
         Err(e) => eprintln!("\nDownload failed: {}", e),
     }
